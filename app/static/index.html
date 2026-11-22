@@ -72,6 +72,11 @@
   .table-scroll { max-height: 460px; overflow-y: auto; }
   .filters button.on { background: var(--blue-dark); }
   code { background: #f1f5f9; padding: 1px 5px; border-radius: 4px; }
+  .size-input { width: 72px; padding: 5px 7px; font-size: 13px;
+    border: 1px solid var(--line); border-radius: 6px; }
+  .num-input { width: 110px; padding: 5px 7px; font-size: 13px;
+    border: 1px solid var(--line); border-radius: 6px; }
+  .rec { font-size: 15px; font-weight: 700; }
 </style>
 </head>
 <body>
@@ -124,6 +129,30 @@
       </table>
     </div>
   </section>
+
+  <section class="card" id="simCard" hidden>
+    <h2>4. 抽检回放试算</h2>
+    <p class="muted" style="margin-top:0">
+      全批拆完后，以当前全检记录为真值：按随机种子生成 100 条不放回拆检顺序，
+      每轮各档都从同一顺序的开头取足该档台数作为已检，其余只给初判并沿用现有估算。
+      三类估数与全检实数的绝对差都不超过允许误差（台）才算该轮达标。
+      达标次数 ≥ 90 的最小档位即为推荐量。
+    </p>
+    <div id="simStatus" style="margin-bottom:12px"></div>
+    <div class="row" style="margin-bottom:10px">
+      <label class="muted">允许误差（台）
+        <input class="num-input" id="simTolerance" type="number" min="0" step="1" value="2" />
+      </label>
+      <label class="muted">随机种子
+        <input class="num-input" id="simSeed" type="number" step="1" value="20261122" />
+      </label>
+      <span class="muted">拆检台数（1～6 档，每档 ≥ 1 且少于全批）：</span>
+      <span id="simSizeInputs" class="row" style="gap:6px"></span>
+      <button class="ghost small" id="simAddSizeBtn" type="button">＋ 加一档</button>
+      <button id="simRunBtn" type="button">开始试算</button>
+    </div>
+    <div id="simResult"></div>
+  </section>
 </main>
 <div id="toast"></div>
 
@@ -133,6 +162,11 @@ const LABELS = {power: "电源", drive: "驱动", control: "控制"};
 let state = null;
 let filter = "all";
 let pollTimer = null;
+let simJob = null;          // 当前试算任务（含结果）
+let simTimer = null;        // 试算轮询
+let simSizes = [3, 5, 8];   // 档位输入框
+let simSizesTunedFor = null; // 已按哪个批次的台数调整过默认档位
+const SIM_POLL_MS = 800;
 
 function toast(msg, isErr) {
   const el = document.getElementById("toast");
@@ -186,7 +220,6 @@ async function refresh() {
     render();
   } catch (e) { /* 批次不存在等情况静默 */ }
 }
-
 async function inspect(id, category) {
   try {
     state = await api(`/api/machines/${encodeURIComponent(id)}/inspect`, {
@@ -211,6 +244,7 @@ function render() {
   document.getElementById("machineCard").hidden = false;
   renderEstimate();
   renderMachines();
+  renderSimulation();
   if (!pollTimer) pollTimer = setInterval(refresh, 3000);
 }
 
@@ -235,7 +269,8 @@ function renderEstimate() {
   grid.innerHTML = CATS.map(c => {
     const total = e.available ? e.estimated_total[c] : null;
     const insp = e.inspected_counts[c];
-    const unPart = e.available ? e.estimated_uninspected[c] : null;
+    const unPart = e.available && e.estimated_uninspected
+      ? e.estimated_uninspected[c] : null;
     const sub = e.n_uninspected === 0
       ? `实检 ${insp} 台（全批实数）`
       : `实检 ${insp} 台 ＋ 未检折算 ${fmt(unPart, 2)} 台`;
@@ -306,9 +341,201 @@ function renderMachines() {
   }).join("");
 }
 
+// ── 抽检回放试算 ───────────────────────────────────────────────
+function initSimSizeInputs() {
+  const box = document.getElementById("simSizeInputs");
+  box.innerHTML = simSizes.map((v, i) =>
+    `<input class="size-input sim-size" type="number" min="1" step="1"
+      data-idx="${i}" value="${v}" title="第 ${i + 1} 档拆检台数" />`
+  ).join("");
+  document.getElementById("simAddSizeBtn").disabled = simSizes.length >= 6;
+}
+document.getElementById("simSizeInputs").addEventListener("input", ev => {
+  if (!ev.target.classList.contains("sim-size")) return;
+  simSizes[Number(ev.target.dataset.idx)] = ev.target.value;
+});
+document.getElementById("simAddSizeBtn").addEventListener("click", () => {
+  if (simSizes.length >= 6) return;
+  simSizes.push("");
+  initSimSizeInputs();
+  const inputs = document.querySelectorAll(".sim-size");
+  inputs[inputs.length - 1].focus();
+});
+
+function parseSimSizes() {
+  const nTotal = state.estimate.n_total;
+  const raw = Array.from(document.querySelectorAll(".sim-size"))
+    .map(el => el.value.trim());
+  if (raw.length < 1 || raw.length > 6) throw new Error("拆检台数须为 1～6 档");
+  const sizes = raw.map(v => {
+    const num = Number(v);
+    if (v === "" || !Number.isInteger(num)) throw new Error("拆检台数必须为整数");
+    if (num < 1 || num >= nTotal)
+      throw new Error(`每档拆检台数须不少于 1 台且少于全批 ${nTotal} 台`);
+    return num;
+  });
+  if (new Set(sizes).size !== sizes.length) throw new Error("各档拆检台数不能重复");
+  return sizes;
+}
+
+document.getElementById("simRunBtn").addEventListener("click", runSimulation);
+
+async function runSimulation() {
+  const tolerance = Number(document.getElementById("simTolerance").value);
+  const seed = Number(document.getElementById("simSeed").value);
+  if (!Number.isInteger(tolerance) || tolerance < 0)
+    return toast("允许误差须为非负整数（台）", true);
+  if (!Number.isInteger(seed)) return toast("随机种子须为整数", true);
+  let sizes;
+  try { sizes = parseSimSizes(); } catch (e) { return toast(e.message, true); }
+  try {
+    if (simTimer) { clearInterval(simTimer); simTimer = null; }
+    simJob = await api("/api/simulations", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({tolerance, seed, sizes}),
+    });
+    // 先同步到服务端最新记录，避免把“页面尚未刷新”误判为试算失效。
+    await refresh();
+    renderSimulation();
+    simTimer = setInterval(pollSimulation, SIM_POLL_MS);
+  } catch (e) { toast(e.message, true); }
+}
+
+async function pollSimulation() {
+  if (!simJob) return;
+  try {
+    const job = await api(`/api/simulations/${simJob.job_id}`);
+    if (!simJob || job.job_id !== simJob.job_id) return;
+    simJob = job;
+    // 页面已同步到比试算基准更新的记录时，立即撤下建议；
+    // 若页面反而落后（刷新失败等），先刷新批次再判断，避免误判。
+    if (state && job.base_version < state.version) {
+      dropStaleSimulation(state.version);
+    } else if (job.state !== "running") {
+      if (simTimer) { clearInterval(simTimer); simTimer = null; }
+    }
+    renderSimulation();
+  } catch (e) {
+    if (simTimer) { clearInterval(simTimer); simTimer = null; }
+  }
+}
+
+function dropStaleSimulation(currentVersion) {
+  if (!simJob || simJob.base_version >= currentVersion) return;
+  if (simJob.state === "running" || simJob.state === "done") {
+    simJob = Object.assign({}, simJob, {
+      state: "invalidated",
+      result: null,
+      reason: `页面已同步到新的拆检记录（版本 v${currentVersion}，` +
+        `本次试算基于 v${simJob.base_version}），旧建议已撤下。`,
+    });
+  }
+  if (simTimer) { clearInterval(simTimer); simTimer = null; }
+}
+
+function renderSimulation() {
+  document.getElementById("simCard").hidden = false;
+  const est = state.estimate;
+  const allDone = est.n_uninspected === 0;
+  const runBtn = document.getElementById("simRunBtn");
+  const status = document.getElementById("simStatus");
+  const result = document.getElementById("simResult");
+
+  // 批次台数变化时，把默认档位调整到“少于全批”的合法范围内。
+  if (simSizesTunedFor !== est.n_total) {
+    simSizesTunedFor = est.n_total;
+    const n = est.n_total;
+    const picked = [];
+    for (const frac of [0.03, 0.08, 0.15]) {
+      const k = Math.max(1, Math.min(n - 1, Math.round(n * frac)));
+      if (k >= 1 && k < n && !picked.includes(k)) picked.push(k);
+    }
+    simSizes = picked.length ? picked : [Math.max(1, n - 1)];
+    initSimSizeInputs();
+  }
+
+  if (simJob) dropStaleSimulation(state.version);
+
+  const running = simJob && simJob.state === "running";
+  runBtn.disabled = !allDone || running;
+  document.getElementById("simAddSizeBtn").disabled = simSizes.length >= 6;
+
+  if (!allDone) {
+    status.innerHTML = `<div class="alert warn">还有 ${est.n_uninspected} 台未拆检，` +
+      `全部拆完后才能用实检记录做回放试算。</div>`;
+    result.innerHTML = "";
+    return;
+  }
+  if (!simJob) {
+    status.innerHTML = '<div class="alert info">全批已拆完（' +
+      `${est.n_total} 台），可填写参数开始回放试算。</div>`;
+    result.innerHTML = "";
+    return;
+  }
+  if (simJob.state === "running") {
+    status.innerHTML = `<div class="alert info">试算进行中：种子 ${simJob.seed}、` +
+      `允许误差 ±${simJob.tolerance} 台、档位 ${simJob.sizes.join(" / ")} 台，` +
+      `共 100 轮。期间其他窗口仍可更正、撤回或换批；一旦记录变化，本次结果将作废。</div>`;
+    result.innerHTML = "";
+    return;
+  }
+  if (simJob.state === "invalidated" || simJob.state === "failed") {
+    const cls = simJob.state === "invalidated" ? "err" : "warn";
+    status.innerHTML = `<div class="alert ${cls}"><b>本次试算已失效：</b>` +
+      `${simJob.reason || "记录已变更"} 请重新试算。</div>`;
+    result.innerHTML = "";
+    return;
+  }
+  // done：再次确认基准版本不落后于页面记录，迟到结果不得恢复建议。
+  if (!simJob.result || simJob.base_version < state.version) {
+    status.innerHTML = '<div class="alert err">页面记录已更新，旧试算结果与建议已撤下。</div>';
+    result.innerHTML = "";
+    return;
+  }
+  status.innerHTML = '<div class="alert ok">试算完成：基于发起时版本 v' +
+    `${simJob.base_version} 的全检记录（${simJob.n_total} 台），` +
+    `种子 ${simJob.seed}，允许误差 ±${simJob.tolerance} 台。</div>`;
+  result.innerHTML = simResultTable(simJob.result);
+}
+
+function simResultTable(r) {
+  const rec = r.recommended_size;
+  const recHtml = rec === null
+    ? '<div class="alert warn"><span class="rec">未找到推荐量：</span>' +
+      `没有任何档位在 100 轮中达标次数达到 ${r.threshold} 次，` +
+      '请调整档位或允许误差后重试。</div>'
+    : `<div class="alert ok"><span class="rec">推荐抽检 ${rec} 台/轮（最小档）：</span>` +
+      `该档 100 轮中达标 ${r.sizes.find(s => s.size === rec).pass_count} 次，` +
+      `达到 ≥ ${r.threshold} 次的要求。</div>`;
+  const rows = r.sizes.map(s => {
+    const mark = s.size === rec ? ' style="background:#f0fdf4;font-weight:600"' : "";
+    return `<tr${mark}>
+      <td>${s.size}</td>
+      <td>${s.pass_count}</td>
+      <td>${s.fail_count}</td>
+      <td>${s.unavailable_count}</td>
+      <td>${(s.pass_rate * 100).toFixed(0)}%</td>
+      <td>${s.meets_threshold ? "达标 ≥ " + r.threshold : "—"}</td>
+    </tr>`;
+  }).join("");
+  return `${recHtml}
+    <p class="muted">全检实数：电源 ${r.actual_total.power} 台、驱动 ` +
+    `${r.actual_total.drive} 台、控制 ${r.actual_total.control} 台；` +
+    `100 条不放回随机顺序，共 ${r.rounds} 轮。</p>
+    <div class="table-scroll" style="max-height:none">
+      <table style="max-width:760px">
+        <thead><tr><th>拆检台数/轮</th><th>达标次数</th><th>未达标次数</th>
+          <th>估数不可用</th><th>达标率</th><th>是否满足推荐门槛</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>`;
+}
+
 // 暴露给内联 onclick
 window.inspect = inspect;
 window.withdraw = withdraw;
+initSimSizeInputs();
 refresh();
 </script>
 </body>

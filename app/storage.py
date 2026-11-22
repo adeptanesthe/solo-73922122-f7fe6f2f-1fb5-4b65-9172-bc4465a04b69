@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 
 from .estimation import CATEGORIES, CAT_INDEX, estimate
+from .simulation import simulations
 
 
 class StoreError(Exception):
@@ -23,15 +24,29 @@ class BatchStore:
         self._lock = asyncio.Lock()
         self._machines: list[dict] = []
         self._id_index: dict[str, int] = {}
+        # 拆检记录版本号：任何写入（登记/更正/撤回/换批）都递增，
+        # 试算任务以发起时版本为基准，版本不一致即失效。
+        self._version = 0
 
     @property
     def lock(self) -> asyncio.Lock:
         return self._lock
 
+    @property
+    def version(self) -> int:
+        """当前拆检记录版本号（须持锁读取）。"""
+        return self._version
+
+    def _bump_version_locked(self) -> None:
+        """写入后递增版本，并立即作废基准版本不一致的试算任务。"""
+        self._version += 1
+        simulations.invalidate_stale_sync(self._version)
+
     def reset_locked(self, machines: list[dict]) -> None:
         """载入新批次（调用方须持锁）。"""
         self._machines = machines
         self._id_index = {m["id"]: i for i, m in enumerate(machines)}
+        self._bump_version_locked()
 
     def snapshot_locked(self) -> dict:
         """基于同一份拆检记录生成机器清单与估算结果（持锁调用）。"""
@@ -39,7 +54,22 @@ class BatchStore:
         return {
             "machines": [dict(m) for m in self._machines],
             "estimate": result.to_payload(),
+            "version": self._version,
         }
+
+    def full_inspection_snapshot_locked(self) -> tuple[list[dict], int]:
+        """取全检记录快照（深拷贝）与版本号，供试算使用。
+
+        仅当全批每台都已有实检类别时允许；否则抛 ``StoreError``。
+        """
+        if not self._machines:
+            raise StoreError("尚未上传批次，请先上传 CSV")
+        pending = sum(1 for m in self._machines if m["inspected"] is None)
+        if pending:
+            raise StoreError(
+                f"仍有 {pending} 台未拆检，全部拆完后才能回放试算"
+            )
+        return [dict(m) for m in self._machines], self._version
 
     def update_inspection_locked(
         self, machine_id: str, category: str | None
@@ -53,6 +83,8 @@ class BatchStore:
             )
         machine = self._machines[self._id_index[machine_id]]
         machine["inspected"] = category
+        # 每次写入都推进版本：即使之后改回原值，试算也不会被误认为仍然有效。
+        self._bump_version_locked()
         return self.snapshot_locked()
 
     def is_empty_locked(self) -> bool:
