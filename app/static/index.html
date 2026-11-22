@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>返修机故障占比估算</title>
+<style>
+  :root {
+    --blue: #2563eb; --blue-dark: #1d4ed8; --gray: #64748b;
+    --line: #e2e8f0; --bg: #f1f5f9; --red: #b91c1c; --amber: #b45309;
+    --green: #15803d;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: "PingFang SC", "Microsoft YaHei", system-ui,
+      "Segoe UI", sans-serif; background: var(--bg); color: #0f172a;
+  }
+  header { background: var(--blue); color: #fff; padding: 16px 24px; }
+  header h1 { margin: 0; font-size: 20px; }
+  header p { margin: 4px 0 0; font-size: 13px; opacity: .85; }
+  main { max-width: 1180px; margin: 20px auto; padding: 0 16px; }
+  .card {
+    background: #fff; border: 1px solid var(--line); border-radius: 10px;
+    padding: 18px 20px; margin-bottom: 18px;
+  }
+  .card h2 { margin: 0 0 12px; font-size: 16px; }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+  button {
+    border: 1px solid var(--blue); background: var(--blue); color: #fff;
+    border-radius: 6px; padding: 7px 14px; font-size: 13px; cursor: pointer;
+  }
+  button:hover { background: var(--blue-dark); }
+  button.ghost { background: #fff; color: var(--blue); }
+  button.small { padding: 3px 9px; font-size: 12px; }
+  button.gray { border-color: var(--gray); background: var(--gray); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { border: 1px solid var(--line); padding: 7px 9px; text-align: center; }
+  th { background: #f8fafc; font-weight: 600; }
+  td.left, th.left { text-align: left; }
+  .badge {
+    display: inline-block; padding: 2px 9px; border-radius: 999px;
+    font-size: 12px; font-weight: 600;
+  }
+  .badge.power { background: #fee2e2; color: #991b1b; }
+  .badge.drive { background: #fef3c7; color: #92400e; }
+  .badge.control { background: #dbeafe; color: #1e40af; }
+  .badge.none { background: #e2e8f0; color: #475569; }
+  .alert {
+    border-radius: 8px; padding: 10px 14px; font-size: 13px; margin-bottom: 12px;
+  }
+  .alert.warn { background: #fffbeb; border: 1px solid #fcd34d; color: var(--amber); }
+  .alert.info { background: #eff6ff; border: 1px solid #bfdbfe; color: #1e40af; }
+  .alert.ok { background: #f0fdf4; border: 1px solid #bbf7d0; color: var(--green); }
+  .alert.err { background: #fef2f2; border: 1px solid #fecaca; color: var(--red); }
+  .grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+  .stat {
+    border: 1px solid var(--line); border-radius: 8px; padding: 12px;
+    background: #f8fafc;
+  }
+  .stat .label { font-size: 12px; color: var(--gray); }
+  .stat .value { font-size: 22px; font-weight: 700; margin-top: 2px; }
+  .stat .sub { font-size: 12px; color: var(--gray); margin-top: 2px; }
+  .muted { color: var(--gray); font-size: 12px; }
+  .matrix-wrap { overflow-x: auto; }
+  #toast {
+    position: fixed; right: 20px; bottom: 20px; display: none;
+    background: #0f172a; color: #fff; padding: 10px 16px; border-radius: 8px;
+    font-size: 13px; max-width: 360px; z-index: 50;
+  }
+  #toast.err { background: var(--red); }
+  .table-scroll { max-height: 460px; overflow-y: auto; }
+  .filters button.on { background: var(--blue-dark); }
+  code { background: #f1f5f9; padding: 1px 5px; border-radius: 4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>返修机故障占比估算</h1>
+  <p>上传 CSV（机器编号 + 分类器初判，≤500 台），随机拆检登记实检类别，实时拟合未检件故障占比</p>
+</header>
+<main>
+  <section class="card">
+    <h2>1. 上传批次 CSV</h2>
+    <div class="row">
+      <input type="file" id="file" accept=".csv,text/csv" />
+      <button id="uploadBtn">上传并建立批次</button>
+      <span class="muted">表头支持「机器编号, 初判」或「id, initial」；类别写 电源/power、驱动/drive、控制/control</span>
+    </div>
+  </section>
+
+  <section class="card" id="estimateCard" hidden>
+    <h2>2. 估算结果</h2>
+    <div id="alertBox"></div>
+    <div class="row" style="margin-bottom:12px">
+      <span class="muted" id="progressText"></span>
+      <button class="ghost small" id="refreshBtn">立即刷新</button>
+      <span class="muted">页面每 3 秒自动同步一次拆检记录（多窗口协同）</span>
+    </div>
+    <div class="grid3" id="statGrid"></div>
+    <div id="fitDetail" style="margin-top:14px"></div>
+  </section>
+
+  <section class="card" id="machineCard" hidden>
+    <h2>3. 拆检登记 / 更正 / 撤回</h2>
+    <div class="row filters" style="margin-bottom:10px">
+      <span class="muted">筛选：</span>
+      <button class="ghost small on" data-filter="all">全部</button>
+      <button class="ghost small" data-filter="uninspected">仅未检</button>
+      <button class="ghost small" data-filter="inspected">仅已检</button>
+    </div>
+    <div class="table-scroll">
+      <table>
+        <thead>
+          <tr>
+            <th class="left">机器编号</th>
+            <th>分类器初判</th>
+            <th>实检类别</th>
+            <th>登记 / 更正</th>
+            <th>撤回（重算未检）</th>
+          </tr>
+        </thead>
+        <tbody id="machineRows"></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+<div id="toast"></div>
+
+<script>
+const CATS = ["power", "drive", "control"];
+const LABELS = {power: "电源", drive: "驱动", control: "控制"};
+let state = null;
+let filter = "all";
+let pollTimer = null;
+
+function toast(msg, isErr) {
+  const el = document.getElementById("toast");
+  el.textContent = msg;
+  el.className = isErr ? "err" : "";
+  el.style.display = "block";
+  clearTimeout(el._t);
+  el._t = setTimeout(() => { el.style.display = "none"; }, 3200);
+}
+function fmt(x, digits = 4) {
+  if (x === null || x === undefined) return "—";
+  return Number(x).toFixed(digits);
+}
+function badge(cat) {
+  if (!cat) return '<span class="badge none">未检</span>';
+  return `<span class="badge ${cat}">${LABELS[cat]}</span>`;
+}
+
+async function api(path, options) {
+  const resp = await fetch(path, options);
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(data.detail || ("请求失败：" + resp.status));
+  return data;
+}
+
+document.getElementById("uploadBtn").addEventListener("click", async () => {
+  const f = document.getElementById("file").files[0];
+  if (!f) return toast("请先选择 CSV 文件", true);
+  const fd = new FormData();
+  fd.append("file", f);
+  try {
+    state = await api("/api/batch", {method: "POST", body: fd});
+    toast(`已载入 ${state.estimate.n_total} 台机器`);
+    render();
+  } catch (e) { toast(e.message, true); }
+});
+
+document.getElementById("refreshBtn").addEventListener("click", refresh);
+document.querySelectorAll(".filters button").forEach(btn => {
+  btn.addEventListener("click", () => {
+    filter = btn.dataset.filter;
+    document.querySelectorAll(".filters button").forEach(b =>
+      b.classList.toggle("on", b === btn));
+    renderMachines();
+  });
+});
+
+async function refresh() {
+  try {
+    state = await api("/api/batch");
+    render();
+  } catch (e) { /* 批次不存在等情况静默 */ }
+}
+
+async function inspect(id, category) {
+  try {
+    state = await api(`/api/machines/${encodeURIComponent(id)}/inspect`, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({category}),
+    });
+    render();
+  } catch (e) { toast(e.message, true); }
+}
+async function withdraw(id) {
+  try {
+    state = await api(`/api/machines/${encodeURIComponent(id)}/withdraw`,
+      {method: "POST"});
+    render();
+  } catch (e) { toast(e.message, true); }
+}
+
+function render() {
+  if (!state) return;
+  document.getElementById("estimateCard").hidden = false;
+  document.getElementById("machineCard").hidden = false;
+  renderEstimate();
+  renderMachines();
+  if (!pollTimer) pollTimer = setInterval(refresh, 3000);
+}
+
+function renderEstimate() {
+  const e = state.estimate;
+  document.getElementById("progressText").textContent =
+    `共 ${e.n_total} 台｜已检 ${e.n_inspected} 台｜未检 ${e.n_uninspected} 台`;
+  const alertBox = document.getElementById("alertBox");
+  if (e.n_uninspected === 0) {
+    alertBox.innerHTML =
+      '<div class="alert ok">全部拆检完毕，以下为实检实数，无需拟合估算。</div>';
+  } else if (!e.available) {
+    alertBox.innerHTML =
+      `<div class="alert warn">估数已撤下：${e.reason}</div>`;
+  } else {
+    alertBox.innerHTML =
+      `<div class="alert info">估数有效：基于 ${e.n_inspected} 台实检样本拟合 ` +
+      `${e.n_uninspected} 台未检件的故障占比（最小平方误差 SSE=${fmt(e.sse, 6)}）。</div>`;
+  }
+
+  const grid = document.getElementById("statGrid");
+  grid.innerHTML = CATS.map(c => {
+    const total = e.available ? e.estimated_total[c] : null;
+    const insp = e.inspected_counts[c];
+    const unPart = e.available ? e.estimated_uninspected[c] : null;
+    const sub = e.n_uninspected === 0
+      ? `实检 ${insp} 台（全批实数）`
+      : `实检 ${insp} 台 ＋ 未检折算 ${fmt(unPart, 2)} 台`;
+    return `<div class="stat">
+      <div class="label">${LABELS[c]}（${c}）</div>
+      <div class="value">${e.available ? fmt(total, 2) : "—"}</div>
+      <div class="sub">${sub}</div>
+    </div>`;
+  }).join("");
+
+  const detail = document.getElementById("fitDetail");
+  if (e.n_uninspected === 0 || !e.available) {
+    detail.innerHTML = e.confusion_matrix
+      ? matrixTable(e.confusion_matrix, e.q, null, null)
+      : '<p class="muted">样本不足，暂无可展示的拟合矩阵。</p>';
+    return;
+  }
+  detail.innerHTML = matrixTable(e.confusion_matrix, e.q, e.pi, e.sse);
+}
+
+function matrixTable(P, q, pi, sse) {
+  const head = CATS.map(c => `<th>${LABELS[c]}初判</th>`).join("");
+  const rows = CATS.map((r, i) =>
+    `<tr><th>${LABELS[r]}实检</th>` +
+    CATS.map((_, j) => `<td>${fmt(P[i][j], 3)}</td>`).join("") + "</tr>"
+  ).join("");
+  const qRow = q
+    ? `<tr><th>未检件初判分布 q</th>` +
+      q.map(v => `<td>${fmt(v, 3)}</td>`).join("") + "</tr>"
+    : "";
+  let piRow = "";
+  if (pi) {
+    piRow = `<tr><th>拟合故障占比 π</th>` +
+      pi.map(v => `<td>${fmt(v, 4)}</td>`).join("") + "</tr>";
+  }
+  return `<div class="matrix-wrap"><table style="max-width:640px">
+    <thead><tr><th class="left">混淆概率矩阵 P（行和=1）</th>${head}</tr></thead>
+    <tbody>${rows}${qRow}${piRow}</tbody></table>
+    ${sse !== null ? `<p class="muted" style="margin-top:8px">
+      最小平方误差 SSE = ||Pᵀπ − q||² = ${fmt(sse, 8)}；
+      约束：π≥0 且 Σπ=1</p>` : ""}
+  </div>`;
+}
+
+function renderMachines() {
+  const tbody = document.getElementById("machineRows");
+  const rows = state.machines.filter(m => {
+    if (filter === "uninspected") return m.inspected === null;
+    if (filter === "inspected") return m.inspected !== null;
+    return true;
+  });
+  tbody.innerHTML = rows.map(m => {
+    const btns = CATS.map(c =>
+      `<button class="small ${m.inspected === c ? "" : "ghost"}"
+        onclick="inspect('${String(m.id).replace(/'/g, "\\'")}', '${c}')">
+        ${LABELS[c]}</button>`).join(" ");
+    const withdraw = m.inspected
+      ? `<button class="small gray"
+          onclick="withdraw('${String(m.id).replace(/'/g, "\\'")}')">撤回</button>`
+      : '<span class="muted">—</span>';
+    return `<tr>
+      <td class="left"><code>${m.id}</code></td>
+      <td>${badge(m.initial)}</td>
+      <td>${badge(m.inspected)}</td>
+      <td>${btns}</td>
+      <td>${withdraw}</td>
+    </tr>`;
+  }).join("");
+}
+
+// 暴露给内联 onclick
+window.inspect = inspect;
+window.withdraw = withdraw;
+refresh();
+</script>
+</body>
+</html>
